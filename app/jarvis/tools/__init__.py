@@ -1,19 +1,16 @@
 # Jarvis Tools Package
 
 """
-Calendar tools for Google Calendar integration.
+DealMaker API integration tools for user validation and investor information.
 """
 
-from .calendar_utils import get_current_time
-from .create_event import create_event
-from .delete_event import delete_event
-from .edit_event import edit_event
-from .list_events import list_events
+from .validate_user import validate_user, debug_api_connection
+from .get_investor_info import get_investor_info, get_investor_investments, format_investor_data
 
 __all__ = [
-    "create_event",
-    "delete_event",
-    "edit_event",
-    "list_events",
-    "get_current_time",
+    "validate_user",
+    "debug_api_connection",
+    "get_investor_info",
+    "get_investor_investments",
+    "format_investor_data",
 ]

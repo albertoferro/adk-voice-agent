@@ -151,7 +151,7 @@ async def client_to_agent_messaging(
             # Send a text message
             content = types.Content(role=role, parts=[types.Part.from_text(text=data)])
             live_request_queue.send_content(content=content)
-            print(f"[CLIENT TO AGENT PRINT]: {data}")
+             # print(f"[CLIENT TO AGENT PRINT]: {data}")
         elif mime_type == "audio/pcm":
             # Send audio data
             decoded_data = base64.b64decode(data)
@@ -162,7 +162,7 @@ async def client_to_agent_messaging(
             live_request_queue.send_realtime(
                 types.Blob(data=decoded_data, mime_type=mime_type)
             )
-            print(f"[CLIENT TO AGENT]: audio/pcm: {len(decoded_data)} bytes")
+            # print(f"[CLIENT TO AGENT]: audio/pcm: {len(decoded_data)} bytes")
 
         else:
             raise ValueError(f"Mime type not supported: {mime_type}")
