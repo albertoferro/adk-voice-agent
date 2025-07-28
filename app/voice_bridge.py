@@ -4,8 +4,10 @@ import json
 import os
 from pathlib import Path
 from typing import AsyncIterable
-import audioop
+import struct
 import logging
+import numpy as np
+import soxr
 
 from dotenv import load_dotenv
 from quart import Quart, request, websocket
@@ -33,6 +35,121 @@ session_service = InMemorySessionService()
 
 app = Quart(__name__)
 
+# Audio conversion functions to replace audioop
+def ulaw2lin(ulaw_data, width):
+    """Convert μ-law encoded audio to linear PCM"""
+    if width != 2:
+        raise ValueError("Only 16-bit (width=2) is supported")
+    
+    result = bytearray()
+    for byte in ulaw_data:
+        # μ-law to linear conversion with proper range handling
+        byte = byte ^ 0xFF  # Un-invert bits
+        sign = byte & 0x80
+        exponent = (byte >> 4) & 0x07
+        mantissa = byte & 0x0F
+        
+        # Linear value calculation with range limiting
+        if exponent == 0:
+            linear = (mantissa << 4) + 8
+        else:
+            linear = ((mantissa + 16) << (exponent + 3)) - 132
+        
+        if sign:
+            linear = -linear
+        
+        # Clamp to 16-bit signed integer range
+        linear = max(-32768, min(32767, linear))
+        
+        # Pack as 16-bit signed integer
+        result.extend(struct.pack('<h', linear))
+    
+    return bytes(result)
+
+def lin2ulaw(linear_data, width):
+    """Convert linear PCM to μ-law encoded audio"""
+    if width != 2:
+        raise ValueError("Only 16-bit (width=2) is supported")
+    
+    result = bytearray()
+    for i in range(0, len(linear_data), 2):
+        # Unpack 16-bit signed integer
+        if i + 1 < len(linear_data):
+            try:
+                sample = struct.unpack('<h', linear_data[i:i+2])[0]
+            except struct.error:
+                sample = 0
+        else:
+            sample = 0
+        
+        # Convert to μ-law with proper range handling
+        sign = 0x80 if sample < 0 else 0x00
+        sample = abs(sample)
+        
+        # Clamp sample to prevent overflow
+        sample = min(sample, 32635)  # Slightly less than 32767 for safety
+        
+        # Add bias and find exponent
+        sample += 132
+        exponent = 7
+        for exp in range(8):
+            if sample <= (0x1F << (exp + 3)) + 132:
+                exponent = exp
+                break
+        
+        # Calculate mantissa
+        if exponent == 0:
+            mantissa = (sample - 132) >> 4
+        else:
+            mantissa = ((sample - 132) >> (exponent + 3)) - 16
+        
+        mantissa = max(0, min(15, mantissa))  # Clamp mantissa to 4-bit range
+        
+        # Combine components
+        ulaw = sign | (exponent << 4) | mantissa
+        result.append(ulaw ^ 0xFF)  # Invert bits as per μ-law standard
+    
+    return bytes(result)
+
+def ratecv(audio_data, width, nchannels, inrate, outrate, state):
+    """Simple sample rate conversion"""
+    if width != 2 or nchannels != 1:
+        raise ValueError("Only 16-bit mono is supported")
+    
+    # Handle empty or invalid input
+    if not audio_data or len(audio_data) < 2:
+        return b'', None
+    
+    # Simple decimation/interpolation based on rate ratio
+    ratio = inrate / outrate
+    
+    if abs(ratio - 3.0) < 0.1:  # 24000 to 8000 Hz (3:1 ratio)
+        # Simple decimation - take every 3rd sample
+        result = bytearray()
+        for i in range(0, len(audio_data) - 1, 6):  # 6 bytes = 3 samples * 2 bytes each
+            if i + 1 < len(audio_data):
+                result.extend(audio_data[i:i+2])
+        return bytes(result), None
+    else:
+        # For other ratios, just return original data
+        # In production, use a proper resampling library
+        return audio_data, None
+
+def mulaw_to_gemini_pcm(mulaw_bytes: bytes) -> np.ndarray:
+    """
+    Convert Twilio μ-law audio to Gemini Live compatible PCM format.
+    Based on solution from: https://github.com/openai/openai-agents-python/issues/304
+    """
+    # Use our custom μ-law to PCM conversion (Python 3.13 compatible)
+    pcm_bytes = ulaw2lin(mulaw_bytes, 2)
+    audio_np = np.frombuffer(pcm_bytes, dtype=np.int16)
+    
+    # Resample from 8kHz (Twilio) to 24kHz (Gemini Live requirement)
+    audio_24k = soxr.resample(audio_np, 8000, 24000)
+    
+    # Convert to float32 range [-1.0, 1.0] as expected by Gemini Live
+    return (audio_24k / 32768.0).astype(np.float32)
+
 class JarvisVoiceBridge:
     def __init__(self):
         # Initialize Gemini client
@@ -42,16 +159,6 @@ class JarvisVoiceBridge:
         
         # Gemini Live API configuration for voice
         self.model_id = "gemini-2.0-flash-exp"
-        self.config = {
-            "response_modalities": ["AUDIO"],
-            "speech_config": types.SpeechConfig(
-                voice_config=types.VoiceConfig(
-                    prebuilt_voice_config=types.PrebuiltVoiceConfig(
-                        voice_name="Aoede"  # Choose a pleasant voice
-                    )
-                )
-            )
-        }
         
         # ADK Runner setup
         self.runner = Runner(
@@ -63,6 +170,10 @@ class JarvisVoiceBridge:
         # Track active streams
         self.stream_sid = None
         self.session_id = None
+        
+        # Audio buffering for better turn detection
+        self.audio_buffer = bytearray()
+        self.buffer_size = 4800  # ~100ms at 24kHz (480 samples * 10 chunks)
 
     async def start_agent_session(self, call_sid):
         """Initialize ADK agent session for this call"""
@@ -98,11 +209,30 @@ class JarvisVoiceBridge:
                     # Extract and convert audio from Twilio format
                     audio_data = data['media']['payload']  # Base64 encoded μ-law
                     decoded_audio = base64.b64decode(audio_data)
-                    # Convert μ-law to 16-bit PCM
-                    pcm_audio = audioop.ulaw2lin(decoded_audio, 2)
-                    yield pcm_audio
+                    # Convert μ-law to Gemini Live compatible format (24kHz float32)
+                    pcm_float32 = mulaw_to_gemini_pcm(decoded_audio)
+                    # Convert numpy float32 array to bytes for Gemini Live API
+                    pcm_bytes = pcm_float32.tobytes()
+                    
+                    # Buffer audio chunks for better turn detection
+                    self.audio_buffer.extend(pcm_bytes)
+                    
+                    # Send buffered audio when we have enough for better processing
+                    if len(self.audio_buffer) >= self.buffer_size:
+                        buffered_audio = bytes(self.audio_buffer)
+                        self.audio_buffer.clear()
+                        logger.info(f"🎤 Sending buffered audio to Gemini: {len(buffered_audio)} bytes (~100ms chunk)")
+                        yield buffered_audio
+                    # Note: Small final chunks on call end will be handled by 'stop' event
                     
                 elif data['event'] == 'stop':
+                    # Send any remaining buffered audio before ending
+                    if len(self.audio_buffer) > 0:
+                        final_audio = bytes(self.audio_buffer)
+                        self.audio_buffer.clear()
+                        logger.info(f"🎤 Sending final buffered audio: {len(final_audio)} bytes")
+                        yield final_audio
+                    
                     logger.info("📞 Call ended")
                     break
                     
@@ -114,9 +244,9 @@ class JarvisVoiceBridge:
         """Convert PCM audio to μ-law format for Twilio"""
         try:
             # Convert sample rate from 24kHz to 8kHz for phone quality
-            converted_audio, _ = audioop.ratecv(audio_data, 2, 1, 24000, 8000, None)
+            converted_audio, _ = ratecv(audio_data, 2, 1, 24000, 8000, None)
             # Convert to μ-law
-            mulaw_audio = audioop.lin2ulaw(converted_audio, 2)
+            mulaw_audio = lin2ulaw(converted_audio, 2)
             # Encode as base64
             return base64.b64encode(mulaw_audio).decode('utf-8')
         except Exception as e:
@@ -162,22 +292,62 @@ class JarvisVoiceBridge:
         try:
             logger.info("🎤 Establishing Gemini Live connection...")
             
+            # Configure session for real-time phone calls - use only valid LiveConnectConfig parameters
+            live_config = {
+                "response_modalities": ["AUDIO"],
+                "speech_config": types.SpeechConfig(
+                    voice_config=types.VoiceConfig(
+                        prebuilt_voice_config=types.PrebuiltVoiceConfig(
+                            voice_name="Aoede"
+                        )
+                    )
+                ),
+                "system_instruction": """You are Jarvis, a voice assistant for phone calls. 
+                
+                CRITICAL PHONE CALL BEHAVIOR:
+                - Respond quickly and naturally to user speech
+                - Don't wait for long pauses - respond as soon as you understand the request
+                - Keep responses concise and conversational
+                - If you hear the user speaking, wait for them to finish their immediate thought, then respond
+                - Be proactive in asking follow-up questions
+                
+                You help with DealMaker authentication and investor information."""
+            }
+            
+            logger.info(f"🔧 Connecting with config: {live_config}")
+            
             async with self.client.aio.live.connect(
                 model=self.model_id, 
-                config=self.config
+                config=live_config
             ) as session:
                 
                 logger.info("✅ Connected to Gemini Live API")
                 
                 # Start streaming audio from Twilio to Gemini
+                logger.info("🎵 Starting audio stream: Twilio → Gemini Live (24kHz float32)")
+                logger.info("🔧 Using mime_type: audio/pcm")
+                
+                # Note: Gemini Live AsyncSession doesn't support send_message, 
+                # it will respond based on audio input and system instructions
+                
+                response_count = 0
+                audio_stream = self.twilio_audio_stream()
+                logger.info("🎤 Audio stream generator created successfully")
+                
                 async for response in session.start_stream(
-                    stream=self.twilio_audio_stream(), 
-                    mime_type='audio/pcm'
+                    stream=audio_stream, 
+                    mime_type='audio/pcm'  # Simplified mime_type
                 ):
+                    response_count += 1
+                    logger.info(f"🔄 Response #{response_count} received from Gemini Live")
                     try:
+                        # Debug: Log all response types to understand what Gemini is sending
+                        logger.info(f"🔄 Received response from Gemini Live: type={type(response)}, data={hasattr(response, 'data')}, text={hasattr(response, 'text')}")
+                        
                         # Handle different types of responses from Gemini
-                        if response.data:
+                        if hasattr(response, 'data') and response.data:
                             # Audio response from Gemini - send back to Twilio
+                            logger.info(f"🎵 Processing audio response: {len(response.data)} bytes")
                             audio_payload = self.convert_audio_to_mulaw(response.data)
                             if audio_payload:
                                 message = {
@@ -187,8 +357,10 @@ class JarvisVoiceBridge:
                                 }
                                 await websocket.send(json.dumps(message))
                                 logger.info("🔊 Sent audio response to caller")
+                            else:
+                                logger.warning("⚠️ Failed to convert Gemini audio to μ-law")
                         
-                        elif response.text:
+                        elif hasattr(response, 'text') and response.text:
                             # Text response - convert to speech via Gemini and send
                             # (This handles cases where Gemini returns text instead of audio)
                             logger.info(f"📝 Processing text through ADK: {response.text}")
@@ -197,10 +369,23 @@ class JarvisVoiceBridge:
                             enhanced_response = await self.process_with_adk_agent(response.text)
                             
                             # Send enhanced response back to Gemini for speech synthesis
-                            await session.send_message(enhanced_response)
+                        
+                        else:
+                            # Debug: Log unexpected response types
+                            logger.warning(f"⚠️ Unexpected response format from Gemini Live: {response}")
+                            # Try to introspect the response object
+                            if hasattr(response, '__dict__'):
+                                logger.info(f"🔍 Response attributes: {list(response.__dict__.keys())}")
+                            else:
+                                logger.info(f"🔍 Response dir: {[attr for attr in dir(response) if not attr.startswith('_')]}")
+                            # Note: Don't send enhanced_response here as it might not be defined
                             
                     except Exception as e:
                         logger.error(f"Error processing Gemini response: {e}")
+                        continue
+                
+                # If we exit the response loop, log why
+                logger.warning("🚨 Exited Gemini Live response loop - this shouldn't happen during active call")
                         
         except Exception as e:
             logger.error(f"Voice call handler error: {e}")
@@ -214,18 +399,33 @@ class JarvisVoiceBridge:
 
 # Quart app routes
 @app.route('/twiml', methods=['POST'])
+@app.route('/twiml/', methods=['POST'])
 async def handle_incoming_call():
     """TwiML endpoint for incoming calls"""
     logger.info("📞 Incoming call received")
     
-    # Get the base URL for WebSocket connection
-    base_url = request.url_root.replace('http', 'ws').rstrip('/')
-    websocket_url = f"{base_url}/voice"
+    # Get the base URL for WebSocket connection - detect ngrok
+    forwarded_host = request.headers.get('X-Forwarded-Host')
+    original_host = request.headers.get('Host')
     
-    # TwiML response to connect call to WebSocket
+    if forwarded_host and 'ngrok' in forwarded_host:
+        # Request comes through ngrok - use secure WebSocket
+        websocket_url = f"wss://{forwarded_host}/voice"
+        logger.info(f"🌐 Using ngrok WebSocket URL: {websocket_url}")
+    elif original_host and 'ngrok' in original_host:
+        # Alternative ngrok detection
+        websocket_url = f"wss://{original_host}/voice"
+        logger.info(f"🌐 Using ngrok WebSocket URL: {websocket_url}")
+    else:
+        # Local development fallback
+        base_url = request.url_root.replace('http', 'ws').rstrip('/')
+        websocket_url = f"{base_url}/voice"
+        logger.info(f"🏠 Using local WebSocket URL: {websocket_url}")
+    
+    # TwiML response to connect call to WebSocket with improved voice
     twiml_response = f'''<?xml version="1.0" encoding="UTF-8"?>
 <Response>
-    <Say voice="alice">Hello! Connecting you to Jarvis, your AI assistant.</Say>
+    <Say voice="Polly.Matthew">Hello! Connecting you to Jarvis, your DealMaker AI assistant.</Say>
     <Connect>
         <Stream url="{websocket_url}" />
     </Connect>
@@ -254,4 +454,4 @@ async def health_check():
 
 if __name__ == '__main__':
     port = int(os.environ.get('PORT', 8080))
-    app.run(host='0.0.0.0', port=port, debug=True) 
+    app.run(host='0.0.0.0', port=port, debug=True)
