@@ -24,7 +24,7 @@ def test_connectivity() -> dict:
     """
     try:
         print("🌐 CONNECTIVITY_TEST: Testing basic connectivity...")
-        response = requests.get("https://app.dealmaker-dev.com", timeout=10, verify=False)
+        response = requests.get("https://app.dealmaker-dev.com", timeout=20, verify=False)
         print(f"✅ CONNECTIVITY_TEST: Status = {response.status_code}")
         return {
             "success": True,
@@ -58,9 +58,12 @@ def send_otp(email: str) -> dict:
             'email': email
         }
         
-        # Test connectivity first
-        connectivity = test_connectivity()
-        print(f"🌐 SEND_OTP: Connectivity test = {connectivity}")
+        # Test connectivity first (but don't fail if it times out)
+        try:
+            connectivity = test_connectivity()
+            print(f"🌐 SEND_OTP: Connectivity test = {connectivity}")
+        except Exception as conn_err:
+            print(f"⚠️ SEND_OTP: Connectivity test failed, but continuing anyway = {conn_err}")
         
         # Prepare headers with more browser-like headers
         headers = {
@@ -80,7 +83,7 @@ def send_otp(email: str) -> dict:
         
         # Make the request
         print("📡 SEND_OTP: Making POST request...")
-        response = requests.post(url, data=data, headers=headers, timeout=30, verify=False)
+        response = requests.post(url, data=data, headers=headers, timeout=45, verify=False)
         
         print(f"✅ SEND_OTP: Response status code = {response.status_code}")
         print(f"📄 SEND_OTP: Response headers = {dict(response.headers)}")
@@ -145,9 +148,12 @@ def verify_otp(email: str, code: str) -> dict:
             'code': code
         }
         
-        # Test connectivity first
-        connectivity = test_connectivity()
-        print(f"🌐 VERIFY_OTP: Connectivity test = {connectivity}")
+        # Test connectivity first (but don't fail if it times out)
+        try:
+            connectivity = test_connectivity()
+            print(f"🌐 VERIFY_OTP: Connectivity test = {connectivity}")
+        except Exception as conn_err:
+            print(f"⚠️ VERIFY_OTP: Connectivity test failed, but continuing anyway = {conn_err}")
         
         # Prepare headers with more browser-like headers
         headers = {
@@ -168,7 +174,7 @@ def verify_otp(email: str, code: str) -> dict:
         
         # Make the request
         print("📡 VERIFY_OTP: Making POST request...")
-        response = requests.post(url, data=data, headers=headers, timeout=30, verify=False)
+        response = requests.post(url, data=data, headers=headers, timeout=45, verify=False)
         
         print(f"✅ VERIFY_OTP: Response status code = {response.status_code}")
         print(f"📄 VERIFY_OTP: Response headers = {dict(response.headers)}")
@@ -298,6 +304,9 @@ def validate_user(email: str = "", code: str = "") -> dict:
     Returns:
         dict: Result of the validation process
     """
+    print(f"🚀🚀🚀 VALIDATE_USER CALLED: email='{email}', code='{code}' 🚀🚀🚀")
+    print(f"📞 VALIDATE_USER: Function actually being executed!")
+    
     if not email:
         return {
             "success": False,
@@ -306,17 +315,47 @@ def validate_user(email: str = "", code: str = "") -> dict:
         }
     
     if not code:
-        # Step 1: Send OTP
-        result = send_otp(email)
-        if result["success"]:
-            result["step"] = "otp_sent"
-            result["message"] += " Once you receive the code, please provide it to complete the validation."
+        # Step 1: Send OTP with retry logic
+        print(f"🔄 VALIDATE_USER: Sending OTP to {email}")
+        max_retries = 2
+        
+        for attempt in range(1, max_retries + 1):
+            result = send_otp(email)
+            if result["success"]:
+                result["step"] = "otp_sent"
+                result["message"] += " Once you receive the code, please provide it to complete the validation."
+                print(f"✅ VALIDATE_USER: OTP sent successfully on attempt {attempt}")
+                return result
+            else:
+                print(f"⚠️ VALIDATE_USER: Attempt {attempt} failed: {result.get('message')}")
+                if attempt < max_retries:
+                    print(f"🔄 VALIDATE_USER: Retrying in 3 seconds...")
+                    import time
+                    time.sleep(3)
+        
+        # If all retries failed
+        result["step"] = "send_failed"
         return result
     else:
-        # Step 2: Verify OTP
-        result = verify_otp(email, code)
-        if result["success"]:
-            result["step"] = "validation_complete"
-        else:
-            result["step"] = "verification_failed"
+        # Step 2: Verify OTP with retry logic
+        print(f"🔄 VALIDATE_USER: Verifying OTP for {email}")
+        max_retries = 2
+        
+        for attempt in range(1, max_retries + 1):
+            result = verify_otp(email, code)
+            if result["success"]:
+                result["step"] = "validation_complete"
+                print(f"✅ VALIDATE_USER: OTP verified successfully on attempt {attempt}")
+                return result
+            else:
+                print(f"⚠️ VALIDATE_USER: Verify attempt {attempt} failed: {result.get('message')}")
+                # Don't retry on invalid code, only on network errors
+                if "Network error" in result.get("message", "") and attempt < max_retries:
+                    print(f"🔄 VALIDATE_USER: Network error, retrying in 2 seconds...")
+                    import time
+                    time.sleep(2)
+                else:
+                    break
+        
+        result["step"] = "verification_failed"
         return result 

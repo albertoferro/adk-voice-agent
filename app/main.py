@@ -2,6 +2,7 @@ import asyncio
 import base64
 import json
 import os
+import sys
 from pathlib import Path
 from typing import AsyncIterable
 
@@ -17,6 +18,17 @@ from google.adk.sessions.in_memory_session_service import InMemorySessionService
 from google.genai import types
 from jarvis.agent import root_agent
 
+# Enable detailed logging
+import logging
+logging.basicConfig(
+    level=logging.INFO,
+    format='%(asctime)s - %(name)s - %(levelname)s - %(message)s',
+    handlers=[
+        logging.StreamHandler(sys.stdout)
+    ]
+)
+logger = logging.getLogger(__name__)
+
 #
 # ADK Streaming
 #
@@ -30,6 +42,9 @@ session_service = InMemorySessionService()
 
 async def start_agent_session(session_id, is_audio=False):
     """Starts an agent session"""
+    
+    logger.info(f"🚀 STARTING AGENT SESSION: {session_id}, audio={is_audio}")
+    logger.info(f"🔧 Agent tools: {[tool.__name__ for tool in root_agent.tools]}")
 
     # Create a Session
     session = await session_service.create_session(
@@ -37,6 +52,8 @@ async def start_agent_session(session_id, is_audio=False):
         user_id=session_id,
         session_id=session_id,
     )
+    
+    logger.info(f"✅ Session created: {session_id}")
 
     # Create a Runner
     runner = Runner(
@@ -44,6 +61,8 @@ async def start_agent_session(session_id, is_audio=False):
         agent=root_agent,
         session_service=session_service,
     )
+    
+    logger.info(f"✅ Runner created for session: {session_id}")
 
     # Set response modality
     modality = "AUDIO" if is_audio else "TEXT"
@@ -114,7 +133,8 @@ async def agent_to_client_messaging(
                     "role": "model",
                 }
                 await websocket.send_text(json.dumps(message))
-                print(f"[AGENT TO CLIENT]: text/plain: {part.text}")
+                logger.info(f"🤖 AGENT RESPONSE: {part.text}")
+                print(f"🤖🤖🤖 AGENT RESPONSE: {part.text} 🤖🤖🤖")
 
             # If it's audio, send Base64 encoded audio data
             is_audio = (
@@ -149,9 +169,11 @@ async def client_to_agent_messaging(
         # Send the message to the agent
         if mime_type == "text/plain":
             # Send a text message
+            logger.info(f"👤 USER MESSAGE: {data}")
+            print(f"👤👤👤 USER MESSAGE: {data} 👤👤👤")
             content = types.Content(role=role, parts=[types.Part.from_text(text=data)])
             live_request_queue.send_content(content=content)
-             # print(f"[CLIENT TO AGENT PRINT]: {data}")
+            logger.info(f"📤 Message sent to agent queue")
         elif mime_type == "audio/pcm":
             # Send audio data
             decoded_data = base64.b64decode(data)

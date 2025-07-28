@@ -20,6 +20,9 @@ def get_investor_info(email: str, access_token: str) -> dict:
     Returns:
         dict: Investor information or error details
     """
+    print(f"🚀🚀🚀 GET_INVESTOR_INFO CALLED: email='{email}', token='{access_token[:20] if access_token else 'None'}...' 🚀🚀🚀")
+    print(f"📞 GET_INVESTOR_INFO: Function actually being executed!")
+    
     try:
         url = "https://app.dealmaker-dev.com/api/users/investments"
         
@@ -47,7 +50,7 @@ def get_investor_info(email: str, access_token: str) -> dict:
         
         # Make the request
         print("📡 GET_INVESTOR_INFO: Making GET request...")
-        response = requests.get(url, params=params, headers=headers, timeout=30, verify=False)
+        response = requests.get(url, params=params, headers=headers, timeout=45, verify=False)
         
         print(f"✅ GET_INVESTOR_INFO: Response status code = {response.status_code}")
         print(f"📄 GET_INVESTOR_INFO: Response headers = {dict(response.headers)}")
