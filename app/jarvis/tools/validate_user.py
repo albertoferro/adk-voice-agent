@@ -290,6 +290,99 @@ def debug_api_connection() -> dict:
     }
 
 
+def send_user_otp(email: str) -> dict:
+    """
+    Step 1: Send OTP code to user's email for authentication.
+    This function only sends the OTP and does not verify it.
+
+    Args:
+        email (str): User's email address
+
+    Returns:
+        dict: Status of OTP sending operation with step indicator
+    """
+    print(f"🚀 SEND_USER_OTP: Sending OTP to {email}")
+    
+    if not email:
+        return {
+            "success": False,
+            "message": "Email is required for user validation. Please provide your email address.",
+            "step": "email_required"
+        }
+    
+    # Send OTP with retry logic
+    max_retries = 2
+    
+    for attempt in range(1, max_retries + 1):
+        result = send_otp(email)
+        if result["success"]:
+            result["step"] = "otp_sent"
+            result["message"] += " Once you receive the code, please provide it to complete the validation."
+            print(f"✅ SEND_USER_OTP: OTP sent successfully on attempt {attempt}")
+            return result
+        else:
+            print(f"⚠️ SEND_USER_OTP: Attempt {attempt} failed: {result.get('message')}")
+            if attempt < max_retries:
+                print(f"🔄 SEND_USER_OTP: Retrying in 3 seconds...")
+                import time
+                time.sleep(3)
+    
+    # If all retries failed
+    result["step"] = "send_failed"
+    return result
+
+
+def verify_user_otp(email: str, code: str) -> dict:
+    """
+    Step 2: Verify OTP code and get authentication token.
+    This function only verifies the OTP that was previously sent.
+
+    Args:
+        email (str): User's email address
+        code (str): OTP code received via email
+
+    Returns:
+        dict: Authentication result with bearer token if successful
+    """
+    print(f"🚀 VERIFY_USER_OTP: Verifying OTP for {email}")
+    
+    if not email:
+        return {
+            "success": False,
+            "message": "Email is required for OTP verification.",
+            "step": "email_required"
+        }
+    
+    if not code:
+        return {
+            "success": False,
+            "message": "OTP code is required for verification. Please provide the code you received via email.",
+            "step": "code_required"
+        }
+    
+    # Verify OTP with retry logic
+    max_retries = 2
+    
+    for attempt in range(1, max_retries + 1):
+        result = verify_otp(email, code)
+        if result["success"]:
+            result["step"] = "validation_complete"
+            print(f"✅ VERIFY_USER_OTP: OTP verified successfully on attempt {attempt}")
+            return result
+        else:
+            print(f"⚠️ VERIFY_USER_OTP: Verify attempt {attempt} failed: {result.get('message')}")
+            # Don't retry on invalid code, only on network errors
+            if "Network error" in result.get("message", "") and attempt < max_retries:
+                print(f"🔄 VERIFY_USER_OTP: Network error, retrying in 2 seconds...")
+                import time
+                time.sleep(2)
+            else:
+                break
+    
+    result["step"] = "verification_failed"
+    return result
+
+
 def validate_user(email: str = "", code: str = "") -> dict:
     """
     Main validation function that handles the two-step OTP process.
@@ -315,47 +408,8 @@ def validate_user(email: str = "", code: str = "") -> dict:
         }
     
     if not code:
-        # Step 1: Send OTP with retry logic
-        print(f"🔄 VALIDATE_USER: Sending OTP to {email}")
-        max_retries = 2
-        
-        for attempt in range(1, max_retries + 1):
-            result = send_otp(email)
-            if result["success"]:
-                result["step"] = "otp_sent"
-                result["message"] += " Once you receive the code, please provide it to complete the validation."
-                print(f"✅ VALIDATE_USER: OTP sent successfully on attempt {attempt}")
-                return result
-            else:
-                print(f"⚠️ VALIDATE_USER: Attempt {attempt} failed: {result.get('message')}")
-                if attempt < max_retries:
-                    print(f"🔄 VALIDATE_USER: Retrying in 3 seconds...")
-                    import time
-                    time.sleep(3)
-        
-        # If all retries failed
-        result["step"] = "send_failed"
-        return result
+        # Step 1: Send OTP - delegate to specific function
+        return send_user_otp(email)
     else:
-        # Step 2: Verify OTP with retry logic
-        print(f"🔄 VALIDATE_USER: Verifying OTP for {email}")
-        max_retries = 2
-        
-        for attempt in range(1, max_retries + 1):
-            result = verify_otp(email, code)
-            if result["success"]:
-                result["step"] = "validation_complete"
-                print(f"✅ VALIDATE_USER: OTP verified successfully on attempt {attempt}")
-                return result
-            else:
-                print(f"⚠️ VALIDATE_USER: Verify attempt {attempt} failed: {result.get('message')}")
-                # Don't retry on invalid code, only on network errors
-                if "Network error" in result.get("message", "") and attempt < max_retries:
-                    print(f"🔄 VALIDATE_USER: Network error, retrying in 2 seconds...")
-                    import time
-                    time.sleep(2)
-                else:
-                    break
-        
-        result["step"] = "verification_failed"
-        return result 
+        # Step 2: Verify OTP - delegate to specific function  
+        return verify_user_otp(email, code) 

@@ -4,6 +4,8 @@ from datetime import datetime
 from .tools import (
     get_investor_info,
     validate_user,
+    send_user_otp,
+    verify_user_otp,
 )
 
 # Add debugging for tool calls
@@ -24,8 +26,11 @@ def debug_tool_wrapper(func):
     return wrapper
 
 # Wrap tools with debugging
-validate_user = debug_tool_wrapper(validate_user)
+send_user_otp = debug_tool_wrapper(send_user_otp)
+verify_user_otp = debug_tool_wrapper(verify_user_otp)
 get_investor_info = debug_tool_wrapper(get_investor_info)
+# Keep the original function for backward compatibility
+validate_user = debug_tool_wrapper(validate_user)
 
 root_agent = Agent(
     # A unique name for the agent.
@@ -37,30 +42,42 @@ root_agent = Agent(
     You can authenticate users and provide them with their investment information.
     
     ## User authentication
-    You can validate users through DealMaker's OTP system:
-    - `validate_user`: Two-step authentication process using email and OTP code
+    You can validate users through DealMaker's OTP system using a clear two-step process:
+    - `send_user_otp`: Step 1 - Send OTP code to user's email
+    - `verify_user_otp`: Step 2 - Verify the OTP code and get authentication token
+    
+    ### IMPORTANT: Authentication is a TWO-STEP process - NEVER skip steps!
     
     ### User validation process:
     1. **Request email**: Always ask for the user's email address first
-    2. **Send OTP**: Call `validate_user` with only the email parameter to send OTP to their email
-       - If the call fails due to network issues, wait a moment and retry automatically
+    2. **Send OTP**: Call `send_user_otp(email="user@example.com")` to send OTP to their email
+       - NEVER call verify_user_otp before sending the OTP first
        - Always check the response for success before proceeding
+       - If sending fails, retry or explain the error clearly
     3. **Wait for code**: Inform the user to check their email and provide the OTP code
-    4. **Verify OTP**: Call `validate_user` with both email and code to complete authentication
-       - If verification fails, offer to retry the process
-       - If network error occurs, retry automatically once
+       - Tell them explicitly: "I've sent an OTP code to your email. Please check your email and provide the code when you receive it"
+       - WAIT for the user to provide the code - do not proceed without it
+    4. **Verify OTP**: Only after receiving the code, call `verify_user_otp(email="user@example.com", code="123456")`
+       - This step requires BOTH email and the code the user received
+       - If verification fails, offer to retry the entire process or resend the OTP
     5. **Handle failures**: Always be patient and helpful with retries
     
-    The successful validation returns a bearer token that can be used for authenticated API calls.
+    ### CRITICAL RULES:
+    - NEVER call verify_user_otp without first calling send_user_otp
+    - NEVER assume you have an OTP code - always wait for the user to provide it
+    - If user asks for authentication, ALWAYS start with send_user_otp first
+    - Each step must succeed before moving to the next step
+    
+    The successful verification returns a bearer token that can be used for authenticated API calls.
     
     Example authentication flow:
     - User: "I need to authenticate" or "I want to see my investments"
     - Ask: "Please provide your email address to get started"
     - User: "alberto@dealmaker.tech"
-    - Call: `validate_user(email="alberto@dealmaker.tech")` → OTP sent
-    - Say: "I've sent an OTP code to your email. Please provide the code when you receive it"
+    - Call: `send_user_otp(email="alberto@dealmaker.tech")` → OTP sent
+    - Say: "I've sent an OTP code to your email alberto@dealmaker.tech. Please check your email and provide the code when you receive it"
     - User: "The code is 123456"
-    - Call: `validate_user(email="alberto@dealmaker.tech", code="123456")` → Get bearer token
+    - Call: `verify_user_otp(email="alberto@dealmaker.tech", code="123456")` → Get bearer token
     - Confirm: "Great! You're now authenticated. What would you like to know about your investments?"
     
     ## Investor information
@@ -68,8 +85,8 @@ root_agent = Agent(
     - `get_investor_info`: Get investor's investment information using their email and access token
     
     ### Investor information process:
-    1. **Ensure authentication**: User must be validated first using `validate_user`
-    2. **Extract token**: Get the `bearer_token` from the validation response
+    1. **Ensure authentication**: User must be validated first using the two-step OTP process
+    2. **Extract token**: Get the `bearer_token` from the verify_user_otp response
     3. **Get investor data**: Call `get_investor_info(email, access_token)` with user's email and token
     4. **Present information**: Show relevant investment details to the user
     
@@ -111,14 +128,19 @@ root_agent = Agent(
     
     ## Debug mode:
     When calling tools, always be transparent about the process:
-    - Before calling validate_user: "I'm now sending an OTP to your email..."
-    - After tool success: "Successfully sent! Please check your email."
+    - Before calling send_user_otp: "I'm now sending an OTP to your email..."
+    - After send success: "Successfully sent! Please check your email for the code."
+    - Before calling verify_user_otp: "I'm now verifying the code you provided..."
+    - After verify success: "Authentication successful!"
     - After tool failure: "I encountered an error: [specific error message]"
     
     Today's date is {datetime.now().strftime('%m-%d-%Y')}.
     """,
     tools=[
-        validate_user,
+        send_user_otp,
+        verify_user_otp,
         get_investor_info,
+        # Keep validate_user for backward compatibility
+        validate_user,
     ],
 )
