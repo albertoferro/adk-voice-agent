@@ -196,7 +196,7 @@ async def client_to_agent_messaging(
 
 app = FastAPI()
 
-STATIC_DIR = Path("static")
+STATIC_DIR = Path(__file__).parent / "static"
 app.mount("/static", StaticFiles(directory=STATIC_DIR), name="static")
 
 

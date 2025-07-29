@@ -4,8 +4,15 @@ import json
 import os
 from pathlib import Path
 from typing import AsyncIterable
-import struct
+try:
+    import audioop
+except ImportError:
+    # Python 3.13+ compatibility
+    import audioop_lts as audioop
 import logging
+import struct
+import time
+import wave
 import numpy as np
 import soxr
 
@@ -21,9 +28,76 @@ from google.adk.runners import Runner
 from google.adk.sessions.in_memory_session_service import InMemorySessionService
 
 # Import your voice-optimized agent
-from jarvis.voice_agent import voice_agent
+from jarvis.agent import root_agent
 
 # Load environment variables
+load_dotenv()
+
+# Configure logging
+logging.basicConfig(level=logging.INFO)
+
+# Audio debugging functions
+def analyze_audio_stats(audio_data: bytes, audio_type: str = "PCM") -> dict:
+    """Analyze audio data and return statistics"""
+    if len(audio_data) < 2:
+        return {"error": "Audio data too short"}
+    
+    try:
+        # Convert bytes to 16-bit signed integers
+        samples = struct.unpack(f'<{len(audio_data)//2}h', audio_data)
+        
+        # Calculate statistics
+        max_amp = max(abs(s) for s in samples)
+        avg_amp = sum(abs(s) for s in samples) / len(samples)
+        rms = (sum(s*s for s in samples) / len(samples)) ** 0.5
+        
+        # Check for silence (very low amplitude) - lowered threshold
+        is_silent = max_amp < 50
+        
+        return {
+            "type": audio_type,
+            "samples": len(samples),
+            "duration_ms": len(samples) * 1000 // 8000,  # Assuming 8kHz
+            "max_amplitude": max_amp,
+            "avg_amplitude": avg_amp,
+            "rms": rms,
+            "is_silent": is_silent,
+            "amplitude_range": f"{min(samples)} to {max(samples)}"
+        }
+    except Exception as e:
+        return {"error": f"Failed to analyze: {e}"}
+
+def save_audio_debug(audio_data: bytes, filename: str, sample_rate: int = 8000):
+    """Save audio data as WAV file for debugging"""
+    try:
+        print(f"DEBUG: Saving {filename} with {len(audio_data)} bytes of REAL audio data")
+        print(f"DEBUG: First 20 bytes of audio data: {audio_data[:20].hex() if audio_data else 'EMPTY'}")
+        
+        if len(audio_data) == 0:
+            print(f"ERROR: Audio data is completely empty for {filename}! Skipping file creation.")
+            return
+        
+        # Create audio_debug directory if it doesn't exist
+        debug_dir = Path(__file__).parent / "audio_debug"
+        debug_dir.mkdir(exist_ok=True)
+        
+        audio_file_path = debug_dir / filename
+        print(f"DEBUG: Full path for audio file: {audio_file_path}")
+        
+        with wave.open(str(audio_file_path), 'wb') as wav_file:
+            wav_file.setnchannels(1)  # Mono
+            wav_file.setsampwidth(2)  # 16-bit
+            wav_file.setframerate(sample_rate)
+            wav_file.writeframes(audio_data)
+        
+        # Verify file was written correctly
+        file_size = os.path.getsize(str(audio_file_path))
+        print(f"DEBUG: File {filename} written with total size: {file_size} bytes")
+        logger.info(f"💾 Saved audio debug file: {filename} ({len(audio_data)} audio bytes, {file_size} total bytes)")
+    except Exception as e:
+        print(f"ERROR saving audio debug: {e}")
+        logger.error(f"❌ Failed to save audio debug: {e}")
+
 load_dotenv()
 
 # Configure logging
@@ -163,7 +237,7 @@ class JarvisVoiceBridge:
         # ADK Runner setup
         self.runner = Runner(
             app_name=APP_NAME,
-            agent=voice_agent,
+            agent=root_agent,
             session_service=session_service,
         )
         
@@ -171,9 +245,11 @@ class JarvisVoiceBridge:
         self.stream_sid = None
         self.session_id = None
         
-        # Audio buffering for better turn detection
-        self.audio_buffer = bytearray()
-        self.buffer_size = 4800  # ~100ms at 24kHz (480 samples * 10 chunks)
+        # Audio debugging - accumulate entire call
+        self.debug_audio_count = 0
+        self.full_call_audio_mulaw = []  # Accumulate all μ-law audio
+        self.full_call_audio_pcm = []    # Accumulate all PCM audio
+        self.call_start_time = None
 
     async def start_agent_session(self, call_sid):
         """Initialize ADK agent session for this call"""
@@ -192,10 +268,20 @@ class JarvisVoiceBridge:
 
     async def twilio_audio_stream(self):
         """Handle incoming Twilio media stream and convert audio format"""
+        logger.info("🎵 Starting Twilio audio stream processing...")
+        message_count = 0
+        audio_count = 0
+        
         while True:
             try:
+                message_count += 1
+                logger.debug(f"📨 Waiting for message #{message_count}...")
+                
                 message = await websocket.receive()
                 data = json.loads(message)
+                event_type = data.get('event', 'unknown')
+                
+                logger.debug(f"📋 Received event: {event_type}")
                 
                 if data['event'] == 'start':
                     self.stream_sid = data['start']['streamSid']
@@ -204,41 +290,119 @@ class JarvisVoiceBridge:
                     
                     # Initialize ADK session for this call
                     await self.start_agent_session(call_sid)
+                    logger.info("✅ ADK session initialized")
+                    
+                    # Initialize full call audio recording
+                    self.call_start_time = int(time.time())
+                    self.full_call_audio_mulaw.clear()
+                    self.full_call_audio_pcm.clear()
+                    print(f"🎙️ STARTED RECORDING FULL CALL AUDIO at {self.call_start_time}")
                     
                 elif data['event'] == 'media':
+                    audio_count += 1
+                    self.debug_audio_count += 1
+                    
                     # Extract and convert audio from Twilio format
                     audio_data = data['media']['payload']  # Base64 encoded μ-law
                     decoded_audio = base64.b64decode(audio_data)
-                    # Convert μ-law to Gemini Live compatible format (24kHz float32)
-                    pcm_float32 = mulaw_to_gemini_pcm(decoded_audio)
-                    # Convert numpy float32 array to bytes for Gemini Live API
-                    pcm_bytes = pcm_float32.tobytes()
                     
-                    # Buffer audio chunks for better turn detection
-                    self.audio_buffer.extend(pcm_bytes)
+                    # Convert μ-law to 16-bit PCM
+                    pcm_audio = audioop.ulaw2lin(decoded_audio, 2)
                     
-                    # Send buffered audio when we have enough for better processing
-                    if len(self.audio_buffer) >= self.buffer_size:
-                        buffered_audio = bytes(self.audio_buffer)
-                        self.audio_buffer.clear()
-                        logger.info(f"🎤 Sending buffered audio to Gemini: {len(buffered_audio)} bytes (~100ms chunk)")
-                        yield buffered_audio
-                    # Note: Small final chunks on call end will be handled by 'stop' event
+                    # Audio debugging and analysis
+                    if audio_count % 25 == 0:
+                        # Analyze μ-law audio (as raw bytes)
+                        mulaw_stats = {
+                            "type": "μ-law",
+                            "bytes": len(decoded_audio),
+                            "first_bytes": decoded_audio[:8].hex() if len(decoded_audio) >= 8 else "N/A"
+                        }
+                        
+                        # Analyze PCM audio
+                        pcm_stats = analyze_audio_stats(pcm_audio, "PCM")
+                        
+                        logger.info(f"🎤 Audio #{audio_count}:")
+                        logger.info(f"  μ-law: {mulaw_stats}")
+                        logger.info(f"  PCM: {pcm_stats}")
+                        
+                        # Check for potential issues
+                        if pcm_stats.get('is_silent'):
+                            logger.warning("⚠️ Audio appears to be silent!")
+                        if pcm_stats.get('max_amplitude', 0) > 30000:
+                            logger.warning("⚠️ Audio may be clipping!")
+                    
+                    # Accumulate audio for full call recording
+                    self.full_call_audio_mulaw.append(decoded_audio)
+                    self.full_call_audio_pcm.append(pcm_audio)
+                    
+                    # Debug audio details every 50 packets
+                    if self.debug_audio_count % 50 == 0:
+                        print(f"🎧 AUDIO PACKET #{self.debug_audio_count}:")
+                        print(f"  📥 Raw μ-law: {len(decoded_audio)} bytes -> {decoded_audio[:10].hex()}")
+                        print(f"  🔄 PCM conversion: {len(pcm_audio)} bytes -> {pcm_audio[:20].hex()}")
+                        print(f"  📊 Total accumulated: μ-law={len(self.full_call_audio_mulaw)} packets, PCM={len(self.full_call_audio_pcm)} packets")
+                        
+                        total_mulaw_bytes = sum(len(chunk) for chunk in self.full_call_audio_mulaw)
+                        total_pcm_bytes = sum(len(chunk) for chunk in self.full_call_audio_pcm)
+                        print(f"  📈 Total audio data: μ-law={total_mulaw_bytes} bytes, PCM={total_pcm_bytes} bytes")
+                    
+                    yield pcm_audio
                     
                 elif data['event'] == 'stop':
-                    # Send any remaining buffered audio before ending
-                    if len(self.audio_buffer) > 0:
-                        final_audio = bytes(self.audio_buffer)
-                        self.audio_buffer.clear()
-                        logger.info(f"🎤 Sending final buffered audio: {len(final_audio)} bytes")
-                        yield final_audio
+                    logger.info("📞 Call ended by Twilio")
                     
-                    logger.info("📞 Call ended")
+                    # Save full call audio
+                    await self.save_full_call_audio()
                     break
+                else:
+                    logger.warning(f"⚠️ Unknown event type: {event_type}")
                     
             except Exception as e:
-                logger.error(f"Error processing Twilio stream: {e}")
+                logger.error(f"❌ Error processing Twilio stream: {e}")
+                logger.error(f"❌ Error type: {type(e).__name__}")
+                import traceback
+                logger.error(f"❌ Traceback: {traceback.format_exc()}")
                 break
+        
+        logger.info(f"🏁 Audio stream ended. Messages: {message_count}, Audio packets: {audio_count}")
+
+    async def save_full_call_audio(self):
+        """Save the complete audio from the entire call"""
+        if not self.full_call_audio_mulaw or not self.full_call_audio_pcm:
+            print("⚠️ No audio data to save")
+            return
+            
+        try:
+            # Combine all audio chunks
+            full_mulaw = b''.join(self.full_call_audio_mulaw)
+            full_pcm = b''.join(self.full_call_audio_pcm)
+            
+            # Create filenames with call timestamp
+            call_duration = len(self.full_call_audio_pcm) * 20  # 20ms per packet
+            mulaw_filename = f"full_call_mulaw_{self.call_start_time}_{call_duration}ms.wav"
+            pcm_filename = f"full_call_pcm_{self.call_start_time}_{call_duration}ms.wav"
+            
+            print(f"💾 SAVING FULL CALL AUDIO:")
+            print(f"  📊 Total packets: {len(self.full_call_audio_pcm)}")
+            print(f"  ⏱️ Call duration: ~{call_duration}ms ({call_duration/1000:.1f} seconds)")
+            print(f"  📥 μ-law audio: {len(full_mulaw)} bytes")
+            print(f"  🔄 PCM audio: {len(full_pcm)} bytes")
+            
+            # Convert μ-law to PCM for WAV saving (μ-law is compressed format)
+            mulaw_as_pcm = audioop.ulaw2lin(full_mulaw, 2)
+            save_audio_debug(mulaw_as_pcm, mulaw_filename, 8000)
+            
+            # Save PCM audio (this is what actually went to Gemini)
+            save_audio_debug(full_pcm, pcm_filename, 8000)
+            
+            print(f"✅ Saved complete call audio files:")
+            print(f"  📁 {mulaw_filename}")
+            print(f"  📁 {pcm_filename}")
+            
+        except Exception as e:
+            logger.error(f"❌ Failed to save full call audio: {e}")
+            import traceback
+            logger.error(f"❌ Traceback: {traceback.format_exc()}")
 
     def convert_audio_to_mulaw(self, audio_data: bytes) -> str:
         """Convert PCM audio to μ-law format for Twilio"""
@@ -291,6 +455,7 @@ class JarvisVoiceBridge:
         """Main handler for voice calls - integrates Gemini Live with ADK agent"""
         try:
             logger.info("🎤 Establishing Gemini Live connection...")
+            logger.info(f"🔧 Using model: {self.model_id}")
             
             # Configure session for real-time phone calls - use only valid LiveConnectConfig parameters
             live_config = {
@@ -322,24 +487,27 @@ class JarvisVoiceBridge:
             ) as session:
                 
                 logger.info("✅ Connected to Gemini Live API")
+                logger.info("🎵 Creating audio stream...")
+                
+                audio_stream = self.twilio_audio_stream()
+                logger.info("📡 Starting streaming to Gemini Live...")
                 
                 # Start streaming audio from Twilio to Gemini
-                logger.info("🎵 Starting audio stream: Twilio → Gemini Live (24kHz float32)")
-                logger.info("🔧 Using mime_type: audio/pcm")
-                
-                # Note: Gemini Live AsyncSession doesn't support send_message, 
-                # it will respond based on audio input and system instructions
-                
                 response_count = 0
-                audio_stream = self.twilio_audio_stream()
-                logger.info("🎤 Audio stream generator created successfully")
+                audio_sent_count = 0
+                
+                # Log audio format being sent to Gemini
+                logger.info("🎵 Audio format for Gemini Live:")
+                logger.info("  📊 Format: 16-bit PCM, Mono")
+                logger.info("  📊 Sample Rate: 8kHz (Twilio standard)")
+                logger.info("  📊 MIME Type: audio/pcm")
                 
                 async for response in session.start_stream(
                     stream=audio_stream, 
-                    mime_type='audio/pcm'  # Simplified mime_type
+                    mime_type='audio/pcm'
                 ):
                     response_count += 1
-                    logger.info(f"🔄 Response #{response_count} received from Gemini Live")
+                    logger.info(f"🔄 Received response #{response_count} from Gemini Live")
                     try:
                         # Debug: Log all response types to understand what Gemini is sending
                         logger.info(f"🔄 Received response from Gemini Live: type={type(response)}, data={hasattr(response, 'data')}, text={hasattr(response, 'text')}")
@@ -347,9 +515,12 @@ class JarvisVoiceBridge:
                         # Handle different types of responses from Gemini
                         if hasattr(response, 'data') and response.data:
                             # Audio response from Gemini - send back to Twilio
-                            logger.info(f"🎵 Processing audio response: {len(response.data)} bytes")
+                            print(f"🔊 GEMINI AUDIO RESPONSE #{response_count}:")
+                            print(f"  📤 Received from Gemini: {len(response.data)} bytes -> {response.data[:20].hex()}")
+                            
                             audio_payload = self.convert_audio_to_mulaw(response.data)
                             if audio_payload:
+                                print(f"  📞 Converted to μ-law: {len(audio_payload)} chars (base64)")
                                 message = {
                                     "event": "media",
                                     "streamSid": self.stream_sid,
@@ -363,10 +534,12 @@ class JarvisVoiceBridge:
                         elif hasattr(response, 'text') and response.text:
                             # Text response - convert to speech via Gemini and send
                             # (This handles cases where Gemini returns text instead of audio)
+                            print(f"📝 GEMINI TEXT RESPONSE #{response_count}: {response.text}")
                             logger.info(f"📝 Processing text through ADK: {response.text}")
                             
                             # Process through your ADK agent for enhanced responses
                             enhanced_response = await self.process_with_adk_agent(response.text)
+                            print(f"🤖 ADK ENHANCED RESPONSE: {enhanced_response}")
                             
                             # Send enhanced response back to Gemini for speech synthesis
                         
@@ -381,14 +554,17 @@ class JarvisVoiceBridge:
                             # Note: Don't send enhanced_response here as it might not be defined
                             
                     except Exception as e:
-                        logger.error(f"Error processing Gemini response: {e}")
-                        continue
+                        logger.error(f"❌ Error processing Gemini response: {e}")
                 
-                # If we exit the response loop, log why
-                logger.warning("🚨 Exited Gemini Live response loop - this shouldn't happen during active call")
-                        
+                logger.info("🏁 Finished processing Gemini Live responses")
+                            
         except Exception as e:
-            logger.error(f"Voice call handler error: {e}")
+            logger.error(f"❌ Voice call handler error: {e}")
+            logger.error(f"❌ Error type: {type(e).__name__}")
+            import traceback
+            logger.error(f"❌ Traceback: {traceback.format_exc()}")
+        finally:
+            logger.info("🔚 Voice call handler function ended")
             # Send error message to caller
             error_message = {
                 "event": "media",
@@ -399,14 +575,30 @@ class JarvisVoiceBridge:
 
 # Quart app routes
 @app.route('/twiml', methods=['POST'])
-@app.route('/twiml/', methods=['POST'])
+@app.route('/twiml/', methods=['POST'])  # Handle both with and without trailing slash
 async def handle_incoming_call():
     """TwiML endpoint for incoming calls"""
     logger.info("📞 Incoming call received")
     
-    # Get the base URL for WebSocket connection - detect ngrok
+    # Get the base URL for WebSocket connection - detect if using ngrok
+    # Check ngrok headers to determine the correct URL
     forwarded_host = request.headers.get('X-Forwarded-Host')
-    original_host = request.headers.get('Host')
+    forwarded_proto = request.headers.get('X-Forwarded-Proto')
+    
+    if forwarded_host and 'ngrok' in forwarded_host:
+        # Request comes through ngrok - use secure WebSocket
+        websocket_url = f"wss://{forwarded_host}/voice"
+        logger.info(f"🔒 Using ngrok WebSocket URL: {websocket_url}")
+    elif forwarded_proto == 'https':
+        # HTTPS request - use secure WebSocket
+        host = request.headers.get('Host', request.url_root.split('//')[1].rstrip('/'))
+        websocket_url = f"wss://{host}/voice"
+        logger.info(f"🔒 Using secure WebSocket URL: {websocket_url}")
+    else:
+        # Local development fallback
+        base_url = request.url_root.replace('http', 'ws').rstrip('/')
+        websocket_url = f"{base_url}/voice"
+        logger.info(f"🏠 Using local WebSocket URL: {websocket_url}")
     
     if forwarded_host and 'ngrok' in forwarded_host:
         # Request comes through ngrok - use secure WebSocket
@@ -425,7 +617,7 @@ async def handle_incoming_call():
     # TwiML response to connect call to WebSocket with improved voice
     twiml_response = f'''<?xml version="1.0" encoding="UTF-8"?>
 <Response>
-    <Say voice="Polly.Matthew">Hello! Connecting you to Jarvis, your DealMaker AI assistant.</Say>
+    <Say voice="alice">Hello! Connecting you to Dealmaker AI assistant.</Say>
     <Connect>
         <Stream url="{websocket_url}" />
     </Connect>
@@ -439,11 +631,19 @@ async def handle_incoming_call():
 async def voice_websocket():
     """WebSocket endpoint for Twilio media streams"""
     logger.info("🔌 WebSocket connection established")
+    logger.info(f"🔍 WebSocket headers: {dict(websocket.headers)}")
+    
     bridge = JarvisVoiceBridge()
+    
     try:
+        logger.info("🚀 Starting voice call handler...")
         await bridge.handle_voice_call()
+        logger.info("✅ Voice call handler completed successfully")
     except Exception as e:
-        logger.error(f"WebSocket error: {e}")
+        logger.error(f"❌ WebSocket error: {e}")
+        logger.error(f"❌ Error type: {type(e).__name__}")
+        import traceback
+        logger.error(f"❌ Traceback: {traceback.format_exc()}")
     finally:
         logger.info("🔌 WebSocket connection closed")
 
